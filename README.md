@@ -84,3 +84,4 @@ Este MVP no guarda el estilo en DB. Opciones para **producción**:
 - `.env.example` — variables necesarias.
 
 ¡Éxitos!
+# avatar-generator
