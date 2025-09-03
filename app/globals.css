@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #0b0d12;
+  --card: #131722;
+  --muted: #9aa4b2;
+}
+
+body {
+  background: var(--bg);
+  color: white;
+}
+
+.container {
+  @apply max-w-3xl mx-auto px-4;
+}
+
+.card {
+  @apply bg-[var(--card)] rounded-2xl p-6 shadow-lg;
+}
+
+.btn {
+  @apply rounded-xl px-4 py-2 font-medium bg-white/10 hover:bg-white/20 transition;
+}
+
+.input, .select, .file {
+  @apply bg-black/40 border border-white/10 rounded-xl px-3 py-2 w-full;
+}
+
+.label { @apply text-sm text-[var(--muted)] mb-1 block; }
