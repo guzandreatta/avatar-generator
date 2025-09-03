@@ -15,8 +15,8 @@ export async function POST(req: Request) {
     if (!file || !(file instanceof File)) {
       return new NextResponse('Missing file', { status: 400 });
     }
-    const name = `uploads/${Date.now()}-${file.name}`;
-    const saved = await put(name, file, {
+    const name = `uploads/${Date.now()}-${(file as File).name}`;
+    const saved = await put(name, file as File, {
       access: 'public',
       token: process.env.BLOB_READ_WRITE_TOKEN,
     });
