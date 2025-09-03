@@ -5,7 +5,6 @@ import { useState } from 'react';
 export default function HomePage() {
   const [name, setName] = useState('');
   const [photo, setPhoto] = useState<File | null>(null);
-  const [styleUrl, setStyleUrl] = useState('');
   const [prompt, setPrompt] = useState('clean studio avatar, symmetrical face, plain background, upper body, vibrant yet soft colors');
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -16,12 +15,10 @@ export default function HomePage() {
     setError(null);
     setResultUrl(null);
     if (!photo) { setError('Subí una foto.'); return; }
-    if (!styleUrl) { setError('Pegá el Style URL (desde /admin).'); return; }
 
     const form = new FormData();
     form.append('name', name || 'Usuario');
     form.append('photo', photo);
-    form.append('styleUrl', styleUrl);
     form.append('prompt', prompt);
 
     setLoading(true);
@@ -52,11 +49,6 @@ export default function HomePage() {
         <div>
           <label className="label">Tu foto (frontal, buena luz)</label>
           <input className="file" type="file" accept="image/*" onChange={e => setPhoto(e.target.files?.[0] ?? null)} />
-        </div>
-
-        <div>
-          <label className="label">Style URL (desde /admin)</label>
-          <input className="input" value={styleUrl} onChange={e => setStyleUrl(e.target.value)} placeholder="https://... estilo de referencia" />
         </div>
 
         <div>
