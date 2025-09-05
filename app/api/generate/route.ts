@@ -54,7 +54,7 @@ async function createPredictionByVersion(version: string, input: any, token: str
 }
 
 async function pollPrediction(idOrGetUrl: string, token: string, log: (m: string) => void) {
-  const pollUrl = idOrGetUrl.startsWith('http')
+  const pollUrl = idOrGetUrl?.startsWith?.('http')
     ? idOrGetUrl
     : `https://api.replicate.com/v1/predictions/${idOrGetUrl}`;
 
@@ -76,12 +76,43 @@ async function pollPrediction(idOrGetUrl: string, token: string, log: (m: string
 
 type GenerateBody = {
   imageUrl: string;
-  strength?: number;
-  width?: number;
-  height?: number;
+  strength?: number; // ignorado para Kontext
+  width?: number;    // ignorado para Kontext
+  height?: number;   // ignorado para Kontext
 };
 
 const FIXED_PROMPT = process.env.AVATAR_PROMPT || 'Make this a 90s cartoon';
+
+function buildInputForModel(modelEnv: string, body: GenerateBody, log: (m: string) => void) {
+  const isKontext = /flux[-_.]?kontext/.test(modelEnv.toLowerCase());
+
+  if (isKontext) {
+    // FLUX.1 Kontext Pro → usa input_image + aspect_ratio (no width/height/strength)
+    // Schema oficial: prompt, input_image, aspect_ratio, seed, ... (ver Replicate API > Input schema)
+    // https://replicate.com/black-forest-labs/flux-kontext-pro/versions/.../api
+    const input: Record<string, any> = {
+      prompt: FIXED_PROMPT,
+      input_image: body.imageUrl,
+      aspect_ratio: '1:1',
+      // seed: 0, // si querés resultados reproducibles
+    };
+    log(`detected kontext • input keys: ${Object.keys(input).join(', ')}`);
+    return input;
+  }
+
+  // Genérico (otros modelos img2img)
+  const input: Record<string, any> = {
+    prompt: FIXED_PROMPT,
+    ...(typeof body.strength === 'number' ? { strength: body.strength } : {}),
+    ...(typeof body.width === 'number' ? { width: body.width } : {}),
+    ...(typeof body.height === 'number' ? { height: body.height } : {}),
+    num_inference_steps: 28,
+    guidance_scale: 5,
+    image: body.imageUrl, // default
+  };
+  log(`generic model • input keys: ${Object.keys(input).join(', ')}`);
+  return input;
+}
 
 async function runPipeline(
   payload: GenerateBody,
@@ -89,28 +120,18 @@ async function runPipeline(
     blobToken: string;
     replicateToken: string;
     modelEnv: string;
-    imageKey: string;
   },
   log: (m: string) => void
 ) {
   const t0 = Date.now();
-  const { imageUrl, strength, width, height } = payload;
-  const { blobToken, replicateToken, modelEnv, imageKey } = envs;
+  const { imageUrl } = payload;
+  const { blobToken, replicateToken, modelEnv } = envs;
 
   log(`start • prompt="${FIXED_PROMPT}"`);
   log(`image: ${imageUrl}`);
 
   // 1) Preparar input del modelo
-  const input: Record<string, any> = {
-    prompt: FIXED_PROMPT,
-    ...(typeof strength === 'number' ? { strength } : {}),
-    ...(typeof width === 'number' ? { width } : {}),
-    ...(typeof height === 'number' ? { height } : {}),
-    num_inference_steps: 28,
-    guidance_scale: 5,
-  };
-  input[imageKey] = imageUrl;
-  log(`input keys: ${Object.keys(input).join(', ')}`);
+  const input = buildInputForModel(modelEnv, payload, log);
 
   // 2) Crear predicción (robusto)
   const ref = parseModelEnv(modelEnv);
@@ -168,14 +189,12 @@ async function runPipeline(
 // ===================== Route handler =====================
 
 export async function POST(req: NextRequest) {
-  // ¿Streaming de logs?
   const { searchParams } = new URL(req.url);
   const stream = searchParams.get('stream') === '1';
 
   const blobToken = process.env.BLOB_READ_WRITE_TOKEN;
   const replicateToken = process.env.REPLICATE_API_TOKEN;
   const modelEnv = process.env.REPLICATE_MODEL;
-  const imageKey = process.env.REPLICATE_IMAGE_KEY || 'image';
 
   if (!blobToken || !replicateToken || !modelEnv) {
     const missing = [
@@ -187,8 +206,7 @@ export async function POST(req: NextRequest) {
       .join(', ');
     const msg = `Missing env: ${missing}`;
     if (!stream) return NextResponse.json({ error: msg }, { status: 500 });
-    // en modo stream devolvemos una sola línea de error
-    return new NextResponse(`error: ${msg}\n`, {
+    return new NextResponse(`ERROR:${msg}\n`, {
       status: 500,
       headers: { 'Content-Type': 'text/plain; charset=utf-8' },
     });
@@ -198,10 +216,8 @@ export async function POST(req: NextRequest) {
 
   if (!stream) {
     try {
-      const url = await runPipeline(
-        body,
-        { blobToken, replicateToken, modelEnv, imageKey },
-        (m) => console.log('[generate]', m)
+      const url = await runPipeline(body, { blobToken, replicateToken, modelEnv }, (m) =>
+        console.log('[generate]', m)
       );
       return NextResponse.json({ outputUrl: url });
     } catch (e: any) {
@@ -221,7 +237,7 @@ export async function POST(req: NextRequest) {
 
   (async () => {
     try {
-      const url = await runPipeline(body, { blobToken, replicateToken, modelEnv, imageKey }, log);
+      const url = await runPipeline(body, { blobToken, replicateToken, modelEnv }, log);
       await log(`RESULT:${url}`);
     } catch (e: any) {
       await log(`ERROR:${e?.message || String(e)}`);
