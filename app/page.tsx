@@ -4,9 +4,16 @@ import { useState, useRef } from 'react';
 
 export default function HomePage() {
   const [photo, setPhoto] = useState<File | null>(null);
+
+  // Nuevo: campos para modelo y prompt
+  const [model, setModel] = useState<string>('flux-kontext-apps/cartoonify');
+  const [prompt, setPrompt] = useState<string>('Make this a 90s cartoon');
+
+  // Parámetros opcionales (pueden ser ignorados según el modelo)
   const [strength, setStrength] = useState<number | ''>('');
   const [width, setWidth] = useState<number | ''>('');
   const [height, setHeight] = useState<number | ''>('');
+  const [seed, setSeed] = useState<number | ''>('');
 
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -19,12 +26,9 @@ export default function HomePage() {
   function appendLog(line: string) {
     setLogs((prev) => {
       const next = prev ? prev + '\n' + line : line;
-      // auto-scroll
       queueMicrotask(() => {
         const el = logBoxRef.current;
-        if (el) {
-          el.scrollTop = el.scrollHeight;
-        }
+        if (el) el.scrollTop = el.scrollHeight;
       });
       return next;
     });
@@ -53,18 +57,17 @@ export default function HomePage() {
     try {
       setLoading(true);
 
-      // 1) Subimos la foto a Blob -> imageUrl público
       appendLog('subiendo imagen…');
       const imageUrl = await uploadToBlob(photo);
       appendLog(`imageUrl: ${imageUrl}`);
 
-      // 2) Generamos con streaming de logs
-      const payload: any = { imageUrl };
+      const payload: any = { imageUrl, model, prompt };
       if (strength !== '') payload.strength = Number(strength);
       if (width !== '') payload.width = Number(width);
       if (height !== '') payload.height = Number(height);
+      if (seed !== '') payload.seed = Number(seed);
 
-      appendLog('iniciando generación en Replicate…');
+      appendLog(`iniciando generación en Replicate…`);
       const res = await fetch('/api/generate?stream=1', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -78,9 +81,7 @@ export default function HomePage() {
 
       const reader = res.body?.getReader();
       const decoder = new TextDecoder();
-      if (!reader) {
-        throw new Error('No se pudo abrir el stream de logs');
-      }
+      if (!reader) throw new Error('No se pudo abrir el stream de logs');
 
       let buffer = '';
       while (true) {
@@ -88,9 +89,8 @@ export default function HomePage() {
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
 
-        // Separamos por líneas
         const lines = buffer.split('\n');
-        buffer = lines.pop() || ''; // dejamos la última incompleta en buffer
+        buffer = lines.pop() || '';
 
         for (const line of lines) {
           const trimmed = line.trim();
@@ -114,22 +114,57 @@ export default function HomePage() {
 
   function resetForm() {
     setPhoto(null);
+    setModel('flux-kontext-apps/cartoonify');
+    setPrompt('Make this a 90s cartoon');
     setStrength('');
     setWidth('');
     setHeight('');
+    setSeed('');
     setResultUrl(null);
     setError(null);
     setLogs('');
   }
 
+  const isCartoonify = /flux[-_.]?kontext[-_.]?apps\/cartoonify/i.test(model);
+
   return (
     <div className="space-y-6">
-      <h1 className="text-3xl font-semibold">Generador de Avatars (con logs)</h1>
+      <h1 className="text-3xl font-semibold">Generador de Avatars (Replicate)</h1>
       <p className="text-[var(--muted)]">
-        El backend usa un prompt fijo: <code>Make this a 90s cartoon</code>. Ahora ves el progreso en vivo.
+        Elegí el modelo y el prompt. Tip: <code>flux-kontext-apps/cartoonify</code> ignora el prompt y usa sólo <code>input_image</code>.
       </p>
 
       <form onSubmit={onSubmit} className="card space-y-5">
+        <div className="grid md:grid-cols-2 gap-4">
+          <div>
+            <label className="label">Modelo de Replicate</label>
+            <input
+              className="input"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder="owner/name o owner/name:version o version_id"
+            />
+            <p className="text-xs text-[var(--muted)] mt-1">
+              Ej: <code>flux-kontext-apps/cartoonify</code> o <code>black-forest-labs/flux-kontext-pro</code>
+            </p>
+          </div>
+          <div>
+            <label className="label">Prompt</label>
+            <input
+              className="input"
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              placeholder="Make this a 90s cartoon"
+              disabled={isCartoonify}
+            />
+            {isCartoonify && (
+              <p className="text-xs text-[var(--muted)] mt-1">
+                Este modelo no usa prompt; se ignora.
+              </p>
+            )}
+          </div>
+        </div>
+
         <div>
           <label className="label">Tu foto</label>
           <input
@@ -145,7 +180,7 @@ export default function HomePage() {
           )}
         </div>
 
-        <div className="grid md:grid-cols-3 gap-4">
+        <div className="grid md:grid-cols-4 gap-4">
           <div>
             <label className="label">Strength (opcional)</label>
             <input
@@ -158,9 +193,12 @@ export default function HomePage() {
               value={strength}
               onChange={(e) => setStrength(e.target.value === '' ? '' : Number(e.target.value))}
             />
+            <p className="text-xs text-[var(--muted)] mt-1">
+              Algunos modelos la ignoran (p. ej., cartoonify).
+            </p>
           </div>
           <div>
-            <label className="label">Ancho (px, opcional)</label>
+            <label className="label">Ancho (px)</label>
             <input
               type="number"
               className="input"
@@ -173,7 +211,7 @@ export default function HomePage() {
             />
           </div>
           <div>
-            <label className="label">Alto (px, opcional)</label>
+            <label className="label">Alto (px)</label>
             <input
               type="number"
               className="input"
@@ -183,6 +221,16 @@ export default function HomePage() {
               placeholder="ej: 1024"
               value={height}
               onChange={(e) => setHeight(e.target.value === '' ? '' : Number(e.target.value))}
+            />
+          </div>
+          <div>
+            <label className="label">Seed (opcional)</label>
+            <input
+              type="number"
+              className="input"
+              placeholder="fijá un seed para repetibilidad"
+              value={seed}
+              onChange={(e) => setSeed(e.target.value === '' ? '' : Number(e.target.value))}
             />
           </div>
         </div>

@@ -100,16 +100,14 @@ async function pollPrediction(
 
 type GenerateBody = {
   imageUrl: string;
-  // Para cartoonify no aplican; los ignoramos automáticamente
-  strength?: number;
+  model?: string;     // owner/name, owner/name:version, o version_id
+  prompt?: string;    // opcional; algunos modelos (cartoonify) la ignoran
+  strength?: number;  // para modelos img2img genéricos
   width?: number;
   height?: number;
   seed?: number;
 };
 
-const FIXED_PROMPT = process.env.AVATAR_PROMPT || 'Make this a 90s cartoon';
-
-// Detectores de modelo
 function isCartoonify(modelEnv: string) {
   return /flux[-_.]?kontext[-_.]?apps\/cartoonify/i.test(modelEnv);
 }
@@ -117,13 +115,17 @@ function isKontextGeneric(modelEnv: string) {
   return /black-forest-labs\/flux[-_.]?kontext/i.test(modelEnv);
 }
 
-// Construye el input acorde al modelo elegido
-function buildInputForModel(modelEnv: string, body: GenerateBody, log: (m: string) => void) {
+function buildInputForModel(
+  modelEnv: string,
+  prompt: string,
+  body: GenerateBody,
+  log: (m: string) => void
+) {
   if (isCartoonify(modelEnv)) {
-    // Cartoonify: sólo input_image, aspect_ratio, seed (sin prompt)
+    // Cartoonify: NO usa prompt
     const input: Record<string, any> = {
       input_image: body.imageUrl,
-      aspect_ratio: 'match_input_image', // recomendado por el schema
+      aspect_ratio: 'match_input_image',
       ...(typeof body.seed === 'number' ? { seed: body.seed } : {}),
     };
     log(`detected cartoonify • input keys: ${Object.keys(input).join(', ')}`);
@@ -131,9 +133,9 @@ function buildInputForModel(modelEnv: string, body: GenerateBody, log: (m: strin
   }
 
   if (isKontextGeneric(modelEnv)) {
-    // FLUX Kontext genérico/pro: prompt + input_image + aspect_ratio
+    // FLUX Kontext genérico/pro: sí usa prompt
     const input: Record<string, any> = {
-      prompt: FIXED_PROMPT,
+      prompt,
       input_image: body.imageUrl,
       aspect_ratio: 'match_input_image',
       ...(typeof body.seed === 'number' ? { seed: body.seed } : {}),
@@ -144,7 +146,7 @@ function buildInputForModel(modelEnv: string, body: GenerateBody, log: (m: strin
 
   // Fallback genérico (otros img2img estilo SD)
   const input: Record<string, any> = {
-    prompt: FIXED_PROMPT,
+    prompt,
     ...(typeof body.strength === 'number' ? { strength: body.strength } : {}),
     ...(typeof body.width === 'number' ? { width: body.width } : {}),
     ...(typeof body.height === 'number' ? { height: body.height } : {}),
@@ -159,20 +161,27 @@ function buildInputForModel(modelEnv: string, body: GenerateBody, log: (m: strin
 
 async function runOnce(
   payload: GenerateBody,
-  envs: { blobToken: string; replicateToken: string; modelEnv: string; byVersion?: boolean },
+  envs: {
+    blobToken: string;
+    replicateToken: string;
+    modelEnv: string;
+    prompt: string;
+    byVersion?: boolean;
+  },
   log: (m: string) => void,
   startingTimeoutSec: number
 ) {
   const t0 = Date.now();
-  const { blobToken, replicateToken, modelEnv, byVersion } = envs;
+  const { blobToken, replicateToken, modelEnv, prompt, byVersion } = envs;
 
+  log(`start • model=${modelEnv}`);
   log(
-    `start • ${isCartoonify(modelEnv) ? '(cartoonify no-prompt)' : `prompt="${FIXED_PROMPT}"`}`
+    isCartoonify(modelEnv) ? '(cartoonify ignora prompt)' : `prompt="${prompt}"`
   );
   log(`image: ${payload.imageUrl}`);
 
   // 1) Input
-  const input = buildInputForModel(modelEnv, payload, log);
+  const input = buildInputForModel(modelEnv, prompt, payload, log);
 
   // 2) Crear predicción
   let createRes: Response;
@@ -238,7 +247,7 @@ async function runOnce(
 
 async function runWithRetry(
   payload: GenerateBody,
-  envs: { blobToken: string; replicateToken: string; modelEnv: string },
+  envs: { blobToken: string; replicateToken: string; modelEnv: string; prompt: string },
   log: (m: string) => void
 ) {
   const STARTING_TIMEOUT = Number(process.env.REPLICATE_STARTING_TIMEOUT_SEC || 90);
@@ -278,17 +287,25 @@ export async function POST(req: NextRequest) {
 
   const blobToken = process.env.BLOB_READ_WRITE_TOKEN;
   const replicateToken = process.env.REPLICATE_API_TOKEN;
-  const modelEnv = process.env.REPLICATE_MODEL;
+
+  const body = (await req.json()) as GenerateBody;
+
+  const modelEnv =
+    (body.model && body.model.trim()) || process.env.REPLICATE_MODEL;
+  const prompt =
+    (body.prompt && body.prompt.trim()) ||
+    process.env.AVATAR_PROMPT ||
+    'Make this a 90s cartoon';
 
   if (!blobToken || !replicateToken || !modelEnv) {
     const missing = [
       !blobToken && 'BLOB_READ_WRITE_TOKEN',
       !replicateToken && 'REPLICATE_API_TOKEN',
-      !modelEnv && 'REPLICATE_MODEL',
+      !modelEnv && 'REPLICATE_MODEL (o envíalo en body.model)',
     ]
       .filter(Boolean)
       .join(', ');
-    const msg = `Missing env: ${missing}`;
+    const msg = `Missing env/input: ${missing}`;
     if (!stream) return NextResponse.json({ error: msg }, { status: 500 });
     return new NextResponse(`ERROR:${msg}\n`, {
       status: 500,
@@ -296,12 +313,12 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  const body = (await req.json()) as GenerateBody;
-
   if (!stream) {
     try {
-      const url = await runWithRetry(body, { blobToken, replicateToken, modelEnv }, (m) =>
-        console.log('[generate]', m)
+      const url = await runWithRetry(
+        body,
+        { blobToken, replicateToken, modelEnv, prompt },
+        (m) => console.log('[generate]', m)
       );
       return NextResponse.json({ outputUrl: url });
     } catch (e: any) {
@@ -321,7 +338,7 @@ export async function POST(req: NextRequest) {
 
   (async () => {
     try {
-      const url = await runWithRetry(body, { blobToken, replicateToken, modelEnv }, log);
+      const url = await runWithRetry(body, { blobToken, replicateToken, modelEnv, prompt }, log);
       await log(`RESULT:${url}`);
     } catch (e: any) {
       await log(`ERROR:${e?.message || String(e)}`);
