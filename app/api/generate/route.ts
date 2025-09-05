@@ -2,147 +2,174 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { put } from '@vercel/blob';
 
-function cfEndpoint(account: string) {
-  return `https://api.cloudflare.com/client/v4/accounts/${account}/ai/run/@cf/runwayml/stable-diffusion-v1-5-img2img`;
-}
-
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-export const maxDuration = 300; // hasta 5 min
+export const maxDuration = 300;
+
+// --------- Tipos & utils ---------
+type ModelRef =
+  | { kind: 'ownerName'; owner: string; name: string; version?: string }
+  | { kind: 'version'; version: string };
 
 type GenerateBody = {
-  name?: string;
-  imageUrl: string;   // URL pública (Blob) de la foto fuente
-  // Intensidad de estilización (0..1). 0.75–0.9 = más "dibujo".
-  strength?: number;
-  width?: number;     // 256..2048
-  height?: number;    // 256..2048
-  // Modo “oscuro” opcional (splash de rojo estilizado, NO gore realista)
-  darkHumor?: boolean;
-  bgColor?: string;   // ej: "teal", "#00b3b3", "orange", etc.
+  imageUrl: string;   // URL pública subida antes a Blob
+  strength?: number;  // 0..1 (si tu modelo lo soporta)
+  width?: number;     // opcional, si el modelo lo soporta
+  height?: number;    // opcional
 };
 
-async function urlToBase64(url: string) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`No se pudo leer la imagen fuente: ${res.status}`);
-  const arrayBuffer = await res.arrayBuffer();
-  const b64 = Buffer.from(arrayBuffer).toString('base64');
-  return b64;
+function parseModelEnv(modelEnv?: string): ModelRef {
+  if (!modelEnv) throw new Error('Missing REPLICATE_MODEL');
+  if (modelEnv.includes('/')) {
+    const [owner, rest] = modelEnv.split('/');
+    const [name, version] = rest.split(':');
+    return { kind: 'ownerName', owner, name, version: version || undefined };
+  }
+  return { kind: 'version', version: modelEnv };
 }
 
-function validateAccountId(id?: string) {
-  if (!id) return 'CLOUDFLARE_ACCOUNT_ID (o CF_ACCOUNT_ID) no seteado';
-  if (id.includes('@')) return 'El Account ID no puede ser un email; debe ser un ID hex de 32 caracteres.';
-  if (!/^[a-fA-F0-9]{32}$/.test(id)) return 'Account ID inválido: debe ser un string hex de 32 caracteres.';
-  return null;
+async function fetchLatestVersionId(owner: string, name: string, token: string): Promise<string> {
+  const url = `https://api.replicate.com/v1/models/${owner}/${name}/versions`;
+  const r = await fetch(url, {
+    headers: { Authorization: `Token ${token}` },
+    cache: 'no-store',
+  });
+  if (!r.ok) throw new Error(`Could not fetch versions for ${owner}/${name}: ${await r.text()}`);
+  const j = await r.json() as any;
+  const list = Array.isArray(j) ? j : j.results;
+  if (!Array.isArray(list) || !list.length) throw new Error(`No versions for ${owner}/${name}`);
+  const latest = list[0];
+  const id = latest?.id || latest?.version || latest;
+  if (typeof id !== 'string') throw new Error(`Invalid versions payload for ${owner}/${name}`);
+  return id;
 }
 
+async function createPredictionByModel(owner: string, name: string, input: any, token: string) {
+  const url = `https://api.replicate.com/v1/models/${owner}/${name}/predictions`;
+  return fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Token ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ input }), // sin "model" ni "version" aquí
+  });
+}
+
+async function createPredictionByVersion(version: string, input: any, token: string) {
+  const url = 'https://api.replicate.com/v1/predictions';
+  return fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Token ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ version, input }),
+  });
+}
+
+async function pollPrediction(idOrGetUrl: string, token: string) {
+  const pollUrl = idOrGetUrl.startsWith('http')
+    ? idOrGetUrl
+    : `https://api.replicate.com/v1/predictions/${idOrGetUrl}`;
+
+  while (true) {
+    await new Promise((r) => setTimeout(r, 1200));
+    const r2 = await fetch(pollUrl, { headers: { Authorization: `Token ${token}` } });
+    const j2 = await r2.json();
+    if (j2.status === 'succeeded') return j2.output;
+    if (j2.status === 'failed' || j2.status === 'canceled') {
+      throw new Error('Prediction failed');
+    }
+  }
+}
+
+// --------- Handler ---------
 export async function POST(req: NextRequest) {
   try {
-    const BLOB_TOKEN = process.env.BLOB_READ_WRITE_TOKEN;
-    const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID || process.env.CF_ACCOUNT_ID;
-    const CF_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN || process.env.CF_API_TOKEN;
+    const blobToken = process.env.BLOB_READ_WRITE_TOKEN;
+    const replicateToken = process.env.REPLICATE_API_TOKEN;
+    const modelEnv = process.env.REPLICATE_MODEL;
+    const imageKey = process.env.REPLICATE_IMAGE_KEY || 'image'; // ej: 'image', 'input_image', 'image_prompt'
 
-    if (!BLOB_TOKEN) return NextResponse.json({ error: 'Missing BLOB_READ_WRITE_TOKEN' }, { status: 500 });
-    const idErr = validateAccountId(CF_ACCOUNT_ID);
-    if (idErr) return NextResponse.json({ error: idErr }, { status: 500 });
-    if (!CF_API_TOKEN) return NextResponse.json({ error: 'Missing CLOUDFLARE_API_TOKEN (o CF_API_TOKEN)' }, { status: 500 });
+    if (!blobToken)        return NextResponse.json({ error: 'Missing BLOB_READ_WRITE_TOKEN' }, { status: 500 });
+    if (!replicateToken)   return NextResponse.json({ error: 'Missing REPLICATE_API_TOKEN' }, { status: 500 });
+    if (!modelEnv)         return NextResponse.json({ error: 'Missing REPLICATE_MODEL' }, { status: 500 });
 
     const {
-      name,
       imageUrl,
-      strength = 0.8, // más alto => más “dibujo”
-      width = 1024,
-      height = 1024,
-      darkHumor = false,
-      bgColor = 'teal'
+      strength,
+      width,
+      height,
     } = (await req.json()) as GenerateBody;
 
     if (!imageUrl) {
-      return NextResponse.json({ error: 'Falta imageUrl (URL pública de la foto)' }, { status: 400 });
+      return NextResponse.json({ error: 'Falta imageUrl' }, { status: 400 });
     }
 
-    // 1) Convertimos la foto fuente a base64 para img2img
-    const image_b64 = await urlToBase64(imageUrl);
+    // ✅ PROMPT FIJO (puedes editarlo por env var AVATAR_PROMPT si querés)
+    const FIXED_PROMPT = process.env.AVATAR_PROMPT || 'Make this a 90s cartoon';
 
-    // 2) Prompt para forzar estilo "dibujo" (sin nombrar artistas)
-    const STYLE = [
-      'flat 2D cartoon portrait, thick bold black outlines',
-      'simple facial features (dot eyes, small nose), big smile',
-      'minimal shading, solid flat fills, clean shapes',
-      `solid ${bgColor} background`,
-      'saturated pastel palette, playful yet unsettling tone',
-      'head-and-shoulders, centered, high quality, crisp edges',
-      'painted gouache/marker texture but mostly flat color look'
-    ].join(', ');
+    // Construimos el input del modelo
+    const input: Record<string, any> = {
+      prompt: FIXED_PROMPT,
+      // Los siguientes campos se incluyen solo si vienen definidos en el body
+      ...(typeof strength === 'number' ? { strength } : {}),
+      ...(typeof width === 'number' ? { width } : {}),
+      ...(typeof height === 'number' ? { height } : {}),
+      // Hiperparámetros comunes; ignóralos si tu modelo no los usa
+      num_inference_steps: 28,
+      guidance_scale: 5,
+    };
+    // clave de imagen configurable
+    input[imageKey] = imageUrl;
 
-    const DARK = darkHumor
-      ? ', stylized red paint splatter on neck area, non-realistic, minimal detail'
-      : ', clean neckline, no blood';
+    // Crear predicción (robusto)
+    const ref = parseModelEnv(modelEnv);
+    let createRes: Response;
 
-    const nameBit = name ? `, portrait of ${name}` : '';
-
-    const prompt = `${STYLE}${DARK}${nameBit}`;
-
-    // 3) Negative prompt para evitar realismo, gradientes y fondos complejos
-    const NEGATIVE = [
-      'photorealistic, realistic skin, pores, detailed hair, depth of field',
-      '3d render, gradients, glossy reflections, complex background, text, watermark, logo',
-      'excessive shadows, dramatic lighting, noisy, blurry, artifacts, lowres, pixelated, gore detailed'
-    ].join(', ');
-
-    // 4) Llamada a Cloudflare Workers AI (retorna binario)
-    const endpoint = cfEndpoint(CF_ACCOUNT_ID!);
-    const cfRes = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${CF_API_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        prompt,
-        image_b64,
-        strength,           // 0..1 (0.75–0.9 para cartoon marcado)
-        guidance: 7.0,
-        num_steps: 20,
-        width,
-        height,
-        negative_prompt: NEGATIVE
-      }),
-    });
-
-    const ct = cfRes.headers.get('content-type') || '';
-    if (!cfRes.ok) {
-      const detail = ct.includes('application/json') ? await cfRes.text() : `status=${cfRes.status}`;
-      return NextResponse.json(
-        {
-          error: `Cloudflare AI error ${cfRes.status}`,
-          hint:
-            cfRes.status === 404
-              ? 'Revisá CLOUDFLARE_ACCOUNT_ID (ID de 32 caracteres, NO email).'
-              : cfRes.status === 403
-              ? 'Revisá CLOUDFLARE_API_TOKEN (permiso Workers AI: Run).'
-              : undefined,
-          detail,
-          endpoint
-        },
-        { status: 500 }
-      );
+    if (ref.kind === 'ownerName') {
+      createRes = await createPredictionByModel(ref.owner, ref.name, input, replicateToken);
+      if (!createRes.ok) {
+        const status = createRes.status;
+        if (status === 404 || status === 422) {
+          const version = ref.version || (await fetchLatestVersionId(ref.owner, ref.name, replicateToken));
+          createRes = await createPredictionByVersion(version, input, replicateToken);
+          if (!createRes.ok) {
+            throw new Error(`Replicate error (fallback by version): ${await createRes.text()}`);
+          }
+        } else {
+          throw new Error(`Replicate error (by model): ${await createRes.text()}`);
+        }
+      }
+    } else {
+      createRes = await createPredictionByVersion(ref.version, input, replicateToken);
+      if (!createRes.ok) throw new Error(`Replicate error (by version): ${await createRes.text()}`);
     }
 
-    // 5) Guardamos en Blob el PNG resultante
-    const resultArrayBuffer = await cfRes.arrayBuffer();
-    const fileName = `avatars/${Date.now()}.png`;
-    const saved = await put(fileName, resultArrayBuffer, {
+    const pred = await createRes.json();
+    const out = await pollPrediction(pred.id || pred.urls?.get, replicateToken);
+
+    const url: string | null =
+      Array.isArray(out) ? out[0] : (typeof out === 'string' ? out : null);
+    if (!url) throw new Error('No output from model');
+
+    // Re-host en Blob
+    const imgRes = await fetch(url);
+    if (!imgRes.ok) throw new Error('Could not fetch model output');
+    const buffer = await imgRes.arrayBuffer();
+
+    const outName = `outputs/${Date.now()}-avatar.png`;
+    const saved = await put(outName, new Blob([buffer], { type: 'image/png' }), {
       access: 'public',
-      token: BLOB_TOKEN,
-      contentType: 'image/png',
+      token: blobToken,
     });
 
-    return NextResponse.json({ url: saved.url });
-  } catch (err: any) {
+    return NextResponse.json({ outputUrl: saved.url });
+  } catch (e: any) {
+    console.error(e);
     return NextResponse.json(
-      { error: 'Fallo al generar avatar', detail: String(err?.message || err) },
+      { error: 'Server error', detail: e?.message || String(e) },
       { status: 500 }
     );
   }
