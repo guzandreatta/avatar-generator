@@ -53,11 +53,27 @@ async function createPredictionByVersion(version: string, input: any, token: str
   });
 }
 
-async function pollPrediction(idOrGetUrl: string, token: string, log: (m: string) => void) {
+async function cancelPrediction(idOrCancelUrl: string, token: string) {
+  const url = idOrCancelUrl.startsWith('http')
+    ? idOrCancelUrl
+    : `https://api.replicate.com/v1/predictions/${idOrCancelUrl}/cancel`;
+  await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Token ${token}`, 'Content-Type': 'application/json' },
+  });
+}
+
+async function pollPrediction(
+  idOrGetUrl: string,
+  token: string,
+  log: (m: string) => void,
+  opts?: { maxStartingSeconds?: number }
+) {
   const pollUrl = idOrGetUrl?.startsWith?.('http')
     ? idOrGetUrl
     : `https://api.replicate.com/v1/predictions/${idOrGetUrl}`;
 
+  const startedAt = Date.now();
   let tick = 0;
   while (true) {
     await new Promise((r) => setTimeout(r, 1200));
@@ -65,20 +81,34 @@ async function pollPrediction(idOrGetUrl: string, token: string, log: (m: string
     const j2 = await r2.json();
     tick++;
     log(`poll #${tick} → ${j2.status}`);
-    if (j2.status === 'succeeded') return j2.output;
+    if (j2.status === 'succeeded') return { output: j2.output, cancelUrl: j2.urls?.cancel, id: j2.id };
     if (j2.status === 'failed' || j2.status === 'canceled') {
-      throw new Error('Prediction failed');
+      const detail = j2?.error || 'Prediction failed';
+      throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    }
+    if (j2.status === 'starting' && opts?.maxStartingSeconds) {
+      const secs = (Date.now() - startedAt) / 1000;
+      if (secs > opts.maxStartingSeconds) {
+        const id = j2.id;
+        const cancelUrl = j2.urls?.cancel;
+        const err: any = new Error('Timeout starting prediction');
+        err.code = 'E_TIMEOUT_STARTING';
+        err.id = id;
+        err.cancelUrl = cancelUrl;
+        throw err;
+      }
     }
   }
 }
 
-// ===================== Lógica principal (compartida) =====================
+// ===================== Lógica principal =====================
 
 type GenerateBody = {
   imageUrl: string;
-  strength?: number; // ignorado para Kontext
-  width?: number;    // ignorado para Kontext
-  height?: number;   // ignorado para Kontext
+  // Estos ya no afectan a Kontext (usa aspect_ratio)
+  strength?: number;
+  width?: number;
+  height?: number;
 };
 
 const FIXED_PROMPT = process.env.AVATAR_PROMPT || 'Make this a 90s cartoon';
@@ -87,14 +117,12 @@ function buildInputForModel(modelEnv: string, body: GenerateBody, log: (m: strin
   const isKontext = /flux[-_.]?kontext/.test(modelEnv.toLowerCase());
 
   if (isKontext) {
-    // FLUX.1 Kontext Pro → usa input_image + aspect_ratio (no width/height/strength)
-    // Schema oficial: prompt, input_image, aspect_ratio, seed, ... (ver Replicate API > Input schema)
-    // https://replicate.com/black-forest-labs/flux-kontext-pro/versions/.../api
+    // FLUX Kontext Pro: prompt + input_image + aspect_ratio
+    // Sugerido: 'match_input_image' para respetar el AR de la foto. :contentReference[oaicite:2]{index=2}
     const input: Record<string, any> = {
       prompt: FIXED_PROMPT,
       input_image: body.imageUrl,
-      aspect_ratio: '1:1',
-      // seed: 0, // si querés resultados reproducibles
+      aspect_ratio: 'match_input_image',
     };
     log(`detected kontext • input keys: ${Object.keys(input).join(', ')}`);
     return input;
@@ -108,36 +136,32 @@ function buildInputForModel(modelEnv: string, body: GenerateBody, log: (m: strin
     ...(typeof body.height === 'number' ? { height: body.height } : {}),
     num_inference_steps: 28,
     guidance_scale: 5,
-    image: body.imageUrl, // default
+    image: body.imageUrl,
   };
   log(`generic model • input keys: ${Object.keys(input).join(', ')}`);
   return input;
 }
 
-async function runPipeline(
+async function runOnce(
   payload: GenerateBody,
-  envs: {
-    blobToken: string;
-    replicateToken: string;
-    modelEnv: string;
-  },
-  log: (m: string) => void
+  envs: { blobToken: string; replicateToken: string; modelEnv: string; byVersion?: boolean },
+  log: (m: string) => void,
+  startingTimeoutSec: number
 ) {
   const t0 = Date.now();
-  const { imageUrl } = payload;
-  const { blobToken, replicateToken, modelEnv } = envs;
+  const { blobToken, replicateToken, modelEnv, byVersion } = envs;
 
   log(`start • prompt="${FIXED_PROMPT}"`);
-  log(`image: ${imageUrl}`);
+  log(`image: ${payload.imageUrl}`);
 
-  // 1) Preparar input del modelo
+  // 1) Input
   const input = buildInputForModel(modelEnv, payload, log);
 
-  // 2) Crear predicción (robusto)
-  const ref = parseModelEnv(modelEnv);
+  // 2) Crear predicción
   let createRes: Response;
+  let ref = parseModelEnv(modelEnv);
 
-  if (ref.kind === 'ownerName') {
+  if (!byVersion && ref.kind === 'ownerName') {
     log(`create by model: ${ref.owner}/${ref.name}`);
     createRes = await createPredictionByModel(ref.owner, ref.name, input, replicateToken);
     if (!createRes.ok) {
@@ -153,18 +177,28 @@ async function runPipeline(
       }
     }
   } else {
-    log(`create by version: ${ref.version}`);
-    createRes = await createPredictionByVersion(ref.version, input, replicateToken);
+    // Forzamos por versión (más estable cuando hay problemas)
+    const version =
+      ref.kind === 'version' ? ref.version : (await fetchLatestVersionId(ref.owner, ref.name, replicateToken));
+    log(`create by version: ${version}`);
+    createRes = await createPredictionByVersion(version, input, replicateToken);
     if (!createRes.ok) throw new Error(`Replicate error (by version): ${await createRes.text()}`);
   }
 
   const pred = await createRes.json();
-  log(`prediction id: ${pred.id || '(none)'}`);
+  log(`prediction id: ${pred.id || '(none)'} ${pred.urls?.web ? `→ ${pred.urls.web}` : ''}`);
 
-  // 3) Poll hasta terminar
-  const out = await pollPrediction(pred.id || pred.urls?.get, replicateToken, log);
+  // 3) Poll con timeout para "starting"
+  const polled = await pollPrediction(pred.id || pred.urls?.get, replicateToken, log, {
+    maxStartingSeconds: startingTimeoutSec,
+  });
 
-  const outUrl: string | null = Array.isArray(out) ? out[0] : typeof out === 'string' ? out : null;
+  const outUrl: string | null = Array.isArray(polled.output)
+    ? polled.output[0]
+    : typeof polled.output === 'string'
+    ? polled.output
+    : null;
+
   if (!outUrl) throw new Error('No output from model');
   log(`output url: ${outUrl}`);
 
@@ -184,6 +218,43 @@ async function runPipeline(
   const dt = ((Date.now() - t0) / 1000).toFixed(1);
   log(`done in ${dt}s`);
   return saved.url as string;
+}
+
+async function runWithRetry(
+  payload: GenerateBody,
+  envs: { blobToken: string; replicateToken: string; modelEnv: string },
+  log: (m: string) => void
+) {
+  const STARTING_TIMEOUT = Number(process.env.REPLICATE_STARTING_TIMEOUT_SEC || 90);
+  const MAX_RETRIES = Number(process.env.REPLICATE_MAX_RETRIES || 1); // 1 reintento adicional
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const byVersion = attempt > 0; // en el reintento forzamos por versión
+      if (attempt > 0) log(`retry attempt #${attempt} (forcing version)…`);
+      return await runOnce(payload, { ...envs, byVersion }, log, STARTING_TIMEOUT);
+    } catch (e: any) {
+      // Si es timeout en "starting", intentamos cancelar y reintentar
+      if (e?.code === 'E_TIMEOUT_STARTING') {
+        log(`timeout while starting (>${STARTING_TIMEOUT}s). Cancelling…`);
+        try {
+          const cancelTarget = e.cancelUrl || e.id;
+          if (cancelTarget) await cancelPrediction(cancelTarget, envs.replicateToken);
+          log('cancelled.');
+        } catch (cancelErr: any) {
+          log(`cancel failed: ${cancelErr?.message || String(cancelErr)}`);
+        }
+        if (attempt < MAX_RETRIES) {
+          log('will retry…');
+          continue;
+        }
+      }
+      // otros errores -> salir
+      throw e;
+    }
+  }
+  // no debería llegar acá
+  throw new Error('Exhausted retries');
 }
 
 // ===================== Route handler =====================
@@ -216,7 +287,7 @@ export async function POST(req: NextRequest) {
 
   if (!stream) {
     try {
-      const url = await runPipeline(body, { blobToken, replicateToken, modelEnv }, (m) =>
+      const url = await runWithRetry(body, { blobToken, replicateToken, modelEnv }, (m) =>
         console.log('[generate]', m)
       );
       return NextResponse.json({ outputUrl: url });
@@ -237,7 +308,7 @@ export async function POST(req: NextRequest) {
 
   (async () => {
     try {
-      const url = await runPipeline(body, { blobToken, replicateToken, modelEnv }, log);
+      const url = await runWithRetry(body, { blobToken, replicateToken, modelEnv }, log);
       await log(`RESULT:${url}`);
     } catch (e: any) {
       await log(`ERROR:${e?.message || String(e)}`);
