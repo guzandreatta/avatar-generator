@@ -57,10 +57,7 @@ async function cancelPrediction(idOrCancelUrl: string, token: string) {
   const url = idOrCancelUrl.startsWith('http')
     ? idOrCancelUrl
     : `https://api.replicate.com/v1/predictions/${idOrCancelUrl}/cancel`;
-  await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: `Token ${token}`, 'Content-Type': 'application/json' },
-  });
+  await fetch(url, { method: 'POST', headers: { Authorization: `Token ${token}` } });
 }
 
 async function pollPrediction(
@@ -89,12 +86,10 @@ async function pollPrediction(
     if (j2.status === 'starting' && opts?.maxStartingSeconds) {
       const secs = (Date.now() - startedAt) / 1000;
       if (secs > opts.maxStartingSeconds) {
-        const id = j2.id;
-        const cancelUrl = j2.urls?.cancel;
         const err: any = new Error('Timeout starting prediction');
         err.code = 'E_TIMEOUT_STARTING';
-        err.id = id;
-        err.cancelUrl = cancelUrl;
+        err.id = j2.id;
+        err.cancelUrl = j2.urls?.cancel;
         throw err;
       }
     }
@@ -105,30 +100,49 @@ async function pollPrediction(
 
 type GenerateBody = {
   imageUrl: string;
-  // Estos ya no afectan a Kontext (usa aspect_ratio)
+  // Para cartoonify no aplican; los ignoramos automáticamente
   strength?: number;
   width?: number;
   height?: number;
+  seed?: number;
 };
 
 const FIXED_PROMPT = process.env.AVATAR_PROMPT || 'Make this a 90s cartoon';
 
-function buildInputForModel(modelEnv: string, body: GenerateBody, log: (m: string) => void) {
-  const isKontext = /flux[-_.]?kontext/.test(modelEnv.toLowerCase());
+// Detectores de modelo
+function isCartoonify(modelEnv: string) {
+  return /flux[-_.]?kontext[-_.]?apps\/cartoonify/i.test(modelEnv);
+}
+function isKontextGeneric(modelEnv: string) {
+  return /black-forest-labs\/flux[-_.]?kontext/i.test(modelEnv);
+}
 
-  if (isKontext) {
-    // FLUX Kontext Pro: prompt + input_image + aspect_ratio
-    // Sugerido: 'match_input_image' para respetar el AR de la foto. :contentReference[oaicite:2]{index=2}
+// Construye el input acorde al modelo elegido
+function buildInputForModel(modelEnv: string, body: GenerateBody, log: (m: string) => void) {
+  if (isCartoonify(modelEnv)) {
+    // Cartoonify: sólo input_image, aspect_ratio, seed (sin prompt)
+    const input: Record<string, any> = {
+      input_image: body.imageUrl,
+      aspect_ratio: 'match_input_image', // recomendado por el schema
+      ...(typeof body.seed === 'number' ? { seed: body.seed } : {}),
+    };
+    log(`detected cartoonify • input keys: ${Object.keys(input).join(', ')}`);
+    return input;
+  }
+
+  if (isKontextGeneric(modelEnv)) {
+    // FLUX Kontext genérico/pro: prompt + input_image + aspect_ratio
     const input: Record<string, any> = {
       prompt: FIXED_PROMPT,
       input_image: body.imageUrl,
       aspect_ratio: 'match_input_image',
+      ...(typeof body.seed === 'number' ? { seed: body.seed } : {}),
     };
     log(`detected kontext • input keys: ${Object.keys(input).join(', ')}`);
     return input;
   }
 
-  // Genérico (otros modelos img2img)
+  // Fallback genérico (otros img2img estilo SD)
   const input: Record<string, any> = {
     prompt: FIXED_PROMPT,
     ...(typeof body.strength === 'number' ? { strength: body.strength } : {}),
@@ -137,6 +151,7 @@ function buildInputForModel(modelEnv: string, body: GenerateBody, log: (m: strin
     num_inference_steps: 28,
     guidance_scale: 5,
     image: body.imageUrl,
+    ...(typeof body.seed === 'number' ? { seed: body.seed } : {}),
   };
   log(`generic model • input keys: ${Object.keys(input).join(', ')}`);
   return input;
@@ -151,7 +166,9 @@ async function runOnce(
   const t0 = Date.now();
   const { blobToken, replicateToken, modelEnv, byVersion } = envs;
 
-  log(`start • prompt="${FIXED_PROMPT}"`);
+  log(
+    `start • ${isCartoonify(modelEnv) ? '(cartoonify no-prompt)' : `prompt="${FIXED_PROMPT}"`}`
+  );
   log(`image: ${payload.imageUrl}`);
 
   // 1) Input
@@ -177,7 +194,6 @@ async function runOnce(
       }
     }
   } else {
-    // Forzamos por versión (más estable cuando hay problemas)
     const version =
       ref.kind === 'version' ? ref.version : (await fetchLatestVersionId(ref.owner, ref.name, replicateToken));
     log(`create by version: ${version}`);
@@ -226,7 +242,7 @@ async function runWithRetry(
   log: (m: string) => void
 ) {
   const STARTING_TIMEOUT = Number(process.env.REPLICATE_STARTING_TIMEOUT_SEC || 90);
-  const MAX_RETRIES = Number(process.env.REPLICATE_MAX_RETRIES || 1); // 1 reintento adicional
+  const MAX_RETRIES = Number(process.env.REPLICATE_MAX_RETRIES || 1); // 1 reintento
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -234,9 +250,8 @@ async function runWithRetry(
       if (attempt > 0) log(`retry attempt #${attempt} (forcing version)…`);
       return await runOnce(payload, { ...envs, byVersion }, log, STARTING_TIMEOUT);
     } catch (e: any) {
-      // Si es timeout en "starting", intentamos cancelar y reintentar
       if (e?.code === 'E_TIMEOUT_STARTING') {
-        log(`timeout while starting (>${STARTING_TIMEOUT}s). Cancelling…`);
+        log(`timeout while starting (> ${STARTING_TIMEOUT}s). Cancelling…`);
         try {
           const cancelTarget = e.cancelUrl || e.id;
           if (cancelTarget) await cancelPrediction(cancelTarget, envs.replicateToken);
@@ -249,11 +264,9 @@ async function runWithRetry(
           continue;
         }
       }
-      // otros errores -> salir
       throw e;
     }
   }
-  // no debería llegar acá
   throw new Error('Exhausted retries');
 }
 
