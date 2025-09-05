@@ -1,11 +1,9 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 
 export default function HomePage() {
   const [photo, setPhoto] = useState<File | null>(null);
-
-  // solo opciones técnicas (opcionales)
   const [strength, setStrength] = useState<number | ''>('');
   const [width, setWidth] = useState<number | ''>('');
   const [height, setHeight] = useState<number | ''>('');
@@ -13,6 +11,24 @@ export default function HomePage() {
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const [showLogs, setShowLogs] = useState(true);
+  const [logs, setLogs] = useState<string>('');
+  const logBoxRef = useRef<HTMLTextAreaElement>(null);
+
+  function appendLog(line: string) {
+    setLogs((prev) => {
+      const next = prev ? prev + '\n' + line : line;
+      // auto-scroll
+      queueMicrotask(() => {
+        const el = logBoxRef.current;
+        if (el) {
+          el.scrollTop = el.scrollHeight;
+        }
+      });
+      return next;
+    });
+  }
 
   async function uploadToBlob(file: File): Promise<string> {
     const fd = new FormData();
@@ -27,6 +43,7 @@ export default function HomePage() {
     e.preventDefault();
     setError(null);
     setResultUrl(null);
+    setLogs('');
 
     if (!photo) {
       setError('Subí una foto (frontal, con buena luz).');
@@ -37,25 +54,57 @@ export default function HomePage() {
       setLoading(true);
 
       // 1) Subimos la foto a Blob -> imageUrl público
+      appendLog('subiendo imagen…');
       const imageUrl = await uploadToBlob(photo);
+      appendLog(`imageUrl: ${imageUrl}`);
 
-      // 2) Generamos con Replicate (el backend usa prompt fijo)
+      // 2) Generamos con streaming de logs
       const payload: any = { imageUrl };
       if (strength !== '') payload.strength = Number(strength);
       if (width !== '') payload.width = Number(width);
       if (height !== '') payload.height = Number(height);
 
-      const gen = await fetch('/api/generate', {
+      appendLog('iniciando generación en Replicate…');
+      const res = await fetch('/api/generate?stream=1', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      if (!gen.ok) {
-        const t = await gen.text();
-        throw new Error(`Error al generar el avatar: ${t}`);
+
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(`Fallo inicial: ${t}`);
       }
-      const data = await gen.json(); // { outputUrl }
-      setResultUrl(data.outputUrl);
+
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder();
+      if (!reader) {
+        throw new Error('No se pudo abrir el stream de logs');
+      }
+
+      let buffer = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Separamos por líneas
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // dejamos la última incompleta en buffer
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          appendLog(trimmed);
+          if (trimmed.startsWith('RESULT:')) {
+            const url = trimmed.replace('RESULT:', '').trim();
+            setResultUrl(url);
+          }
+          if (trimmed.startsWith('ERROR:')) {
+            setError(trimmed.replace('ERROR:', '').trim());
+          }
+        }
+      }
     } catch (err: any) {
       setError(err?.message || 'Error desconocido');
     } finally {
@@ -70,13 +119,14 @@ export default function HomePage() {
     setHeight('');
     setResultUrl(null);
     setError(null);
+    setLogs('');
   }
 
   return (
     <div className="space-y-6">
-      <h1 className="text-3xl font-semibold">Generador de Avatars</h1>
+      <h1 className="text-3xl font-semibold">Generador de Avatars (con logs)</h1>
       <p className="text-[var(--muted)]">
-        Este modelo usa SIEMPRE el prompt: <code>Make this a 90s cartoon</code>.
+        El backend usa un prompt fijo: <code>Make this a 90s cartoon</code>. Ahora ves el progreso en vivo.
       </p>
 
       <form onSubmit={onSubmit} className="card space-y-5">
@@ -108,9 +158,6 @@ export default function HomePage() {
               value={strength}
               onChange={(e) => setStrength(e.target.value === '' ? '' : Number(e.target.value))}
             />
-            <p className="text-xs text-[var(--muted)] mt-1">
-              Mayor = más estilizado (puede alejarse más de la foto)
-            </p>
           </div>
           <div>
             <label className="label">Ancho (px, opcional)</label>
@@ -140,18 +187,19 @@ export default function HomePage() {
           </div>
         </div>
 
-        <div className="flex gap-3">
-          <button className="btn" disabled={loading}>
-            {loading ? 'Generando…' : 'Generar avatar'}
-          </button>
-          <button
-            type="button"
-            className="btn"
-            onClick={resetForm}
-            disabled={loading}
-          >
-            Reset
-          </button>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <input id="showlogs" type="checkbox" checked={showLogs} onChange={(e) => setShowLogs(e.target.checked)} />
+            <label htmlFor="showlogs" className="label">Ver logs en vivo</label>
+          </div>
+          <div className="flex gap-3">
+            <button className="btn" disabled={loading}>
+              {loading ? 'Generando…' : 'Generar avatar'}
+            </button>
+            <button type="button" className="btn" onClick={resetForm} disabled={loading}>
+              Reset
+            </button>
+          </div>
         </div>
       </form>
 
@@ -159,6 +207,19 @@ export default function HomePage() {
         <div className="card border border-red-500/40 text-red-300">
           <p className="font-medium">Error</p>
           <p className="opacity-90 mt-1">{error}</p>
+        </div>
+      )}
+
+      {showLogs && (
+        <div className="card">
+          <p className="mb-2 text-[var(--muted)]">Logs</p>
+          <textarea
+            ref={logBoxRef}
+            className="input"
+            style={{ minHeight: 180, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace' }}
+            readOnly
+            value={logs}
+          />
         </div>
       )}
 
@@ -170,10 +231,7 @@ export default function HomePage() {
             <a className="btn" href={resultUrl} download>
               Descargar PNG
             </a>
-            <button
-              className="btn"
-              onClick={() => navigator.clipboard?.writeText(resultUrl)}
-            >
+            <button className="btn" onClick={() => navigator.clipboard?.writeText(resultUrl)}>
               Copiar URL
             </button>
           </div>
